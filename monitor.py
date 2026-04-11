@@ -3,7 +3,6 @@ import pandas as pd
 import requests
 import os
 
-# 從 GitHub Secrets 讀取資訊
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
@@ -11,79 +10,78 @@ def send_telegram_msg(message):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {'chat_id': CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
     try:
-        response = requests.post(url, data=payload, timeout=10)
-        if response.status_code != 200:
-            print(f"Telegram Error: {response.text}")
+        requests.post(url, data=payload, timeout=10)
     except Exception as e:
-        print(f"Network Error: {e}")
+        print(f"Telegram Fail: {e}")
 
-def get_mvrv_data(current_price):
-    """從 Blockchain.info 獲取 Realized Price 並計算 MVRV"""
+def get_mvrv_from_blockchair():
+    """從 Blockchair 獲取數據，這是目前最穩定的免費來源"""
     try:
-        # 獲取比特幣的 Realized Price (已實現價格，即全網平均持倉成本)
-        url = "https://api.blockchain.info/charts/realized-price?timespan=5days&format=json"
+        # Blockchair 的統計接口
+        url = "https://api.blockchair.com/bitcoin/stats"
         res = requests.get(url, timeout=10).json()
-        # 獲取最後一個有效數據點的 'y' 值
-        realized_price = res['values'][-1]['y']
+        data = res['data']
         
-        mvrv_ratio = current_price / realized_price
-        return mvrv_ratio, realized_price
+        # MVRV = Market Cap / Realized Cap
+        market_cap = data['market_cap_usd']
+        realized_cap = data['realized_cap_usd']
+        
+        mvrv = market_cap / realized_cap
+        # 同時獲取實時價格
+        price = data['market_price_usd']
+        
+        return mvrv, price
     except Exception as e:
-        print(f"MVRV 數據抓取失敗: {e}")
+        print(f"MVRV 抓取出錯: {e}")
         return None, None
 
 def run_monitor():
+    print("🚀 啟動診斷監控...")
     try:
-        # 1. 獲取價格與計算 Mayer Multiple (M值)
-        exchange = ccxt.coinbase()
-        bars = exchange.fetch_ohlcv('BTC/USD', timeframe='1d', limit=250)
-        df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'vol'])
+        # 1. 抓取 MVRV 與實時價格 (優先從 Blockchair 拿，因為它最穩)
+        mvrv_value, curr_price = get_mvrv_from_blockchair()
         
-        curr_price = df['close'].iloc[-1]
-        ma200 = df['close'].tail(200).mean()
+        if not curr_price:
+            # 如果 Blockchair 失敗，嘗試用 Coinbase 補救價格
+            print("⚠️ Blockchair 失敗，嘗試 Coinbase...")
+            ex = ccxt.coinbase()
+            ticker = ex.fetch_ticker('BTC/USD')
+            curr_price = ticker['last']
+
+        # 2. 獲取 200MA 用於計算 Mayer Multiple
+        ex = ccxt.coinbase()
+        bars = ex.fetch_ohlcv('BTC/USD', timeframe='1d', limit=250)
+        df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+        ma200 = df['c'].tail(200).mean()
         m_value = curr_price / ma200
+
+        # 3. 診斷與報告
+        m_status = "📉 低估" if m_value < 0.8 else ("📈 過熱" if m_value > 1.8 else "✅ 正常")
         
-        # 2. 獲取 MVRV 數據
-        mvrv_value, realized_price = get_mvrv_data(curr_price)
-
-        # 3. 指標診斷邏輯
-        # Mayer Multiple 診斷
-        if m_value < 0.8: m_status = "📉 低估 (適合加碼)"
-        elif m_value > 1.8: m_status = "📈 過熱 (建議減碼)"
-        else: m_status = "✅ 正常 (穩定定投)"
-
-        # MVRV 診斷
         if mvrv_value:
-            if mvrv_value < 1.0: mv_status = "💎 極度低估 (歷史底部)"
-            elif mvrv_value < 1.2: mv_status = "🛒 價值區 (高性價比)"
-            elif mvrv_value > 3.2: mv_status = "🚨 泡沫區 (高度風險)"
-            elif mvrv_value > 2.4: mv_status = "⚠️ 過熱區 (獲利回吐風險)"
-            else: mv_status = "✅ 健康 (持有/定投)"
+            mv_status = "💎 底部" if mvrv_value < 1.0 else ("🚨 頂部" if mvrv_value > 3.0 else "✅ 健康")
         else:
-            mv_status = "N/A"
+            mv_status = "數據獲取失敗"
 
-        # 4. 構建報告
         report = (
-            f"📊 *BTC 雙指標審計報告*\n"
+            f"📊 *BTC 雙指標監控 (S22U 部署版)*\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"💰 當前價格: `${curr_price:,.0f}`\n"
-            f"🏠 平均成本: `${realized_price:,.0f}`\n\n"
-            f"📈 *Mayer Multiple (M值)*\n"
-            f"數值: `{m_value:.2f}`\n"
-            f"診斷: {m_status}\n\n"
-            f"⛓️ *MVRV Ratio (鏈上盈虧)*\n"
+            f"💰 當前價格: `${curr_price:,.0f}`\n\n"
+            f"📈 *Mayer Multiple*\n"
+            f"數值: `{m_value:.2f}` ({m_status})\n\n"
+            f"⛓️ *MVRV Ratio*\n"
             f"數值: `{mvrv_value:.2f if mvrv_value else 'N/A'}`\n"
-            f"診斷: {mv_status}\n"
+            f"狀態: {mv_status}\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"📢 *核心操作建議*: \n"
-            f"{'🚀 雙指標共振低估，強烈建議加碼！' if (m_value < 0.8 and mvrv_value and mvrv_value < 1.2) else '☕ 目前數據穩定，繼續執行基礎定投。'}"
+            f"📢 *建議*: 繼續執行基準定投計畫。"
         )
         
         send_telegram_msg(report)
-        print("報告發送成功")
 
     except Exception as e:
-        print(f"運行失敗: {e}")
+        # 這是最關鍵的：如果出錯，把錯誤訊息發到你的 Telegram
+        error_msg = f"❌ 系統執行失敗\n原因: `{str(e)}`"
+        send_telegram_msg(error_msg)
 
 if __name__ == "__main__":
     run_monitor()
