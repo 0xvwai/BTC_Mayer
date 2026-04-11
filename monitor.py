@@ -21,10 +21,6 @@ def send_telegram(text):
 # ── CoinMetrics — one metric per call ────────────────────────────────────────
 
 def cm_fetch(metric, page_size=10):
-    """
-    Return (value, date) for a single CoinMetrics metric, or (None, None).
-    page_size=10 gives a 10-day window to handle metrics that lag 2-3 days.
-    """
     url = f"{CM_BASE}?assets=btc&metrics={metric}&frequency=1d&page_size={page_size}"
     try:
         resp = requests.get(url, headers=CM_HDR, timeout=15)
@@ -55,7 +51,6 @@ def get_mvrv():
     val, date = cm_fetch("CapMVRVCur")
     if val:
         return val, date
-    # Fallback: compute from two separate calls
     mkt,  d1 = cm_fetch("CapMrktCurUSD")
     real, _  = cm_fetch("CapRealUSD")
     if mkt and real and real > 0:
@@ -65,19 +60,22 @@ def get_mvrv():
 def get_puell():
     return cm_fetch("IssTotUSD")
 
-def get_nvt():
-    """
-    NVT Signal = Market Cap / on-chain transaction volume.
-    Both fetched separately; TxTfrValAdjUSD can lag up to 3 days
-    so we use page_size=14 to widen the search window.
-    """
-    mkt, d1 = cm_fetch("CapMrktCurUSD")
-    txv, _  = cm_fetch("TxTfrValAdjUSD", page_size=14)
-    if mkt and txv and txv > 0:
-        return mkt / txv, d1
-    # Log which value is missing to help diagnose future N/A issues
-    print(f"  NVT unavailable — CapMrktCurUSD={mkt}, TxTfrValAdjUSD={txv}")
-    return None, None
+def get_fear_and_greed():
+    """Fetch today's Fear & Greed Index from alternative.me (no API key needed)."""
+    try:
+        resp = requests.get(
+            "https://api.alternative.me/fng/?limit=1",
+            timeout=10
+        )
+        resp.raise_for_status()
+        entry = resp.json()["data"][0]
+        value = int(entry["value"])
+        label = entry["value_classification"]
+        print(f"  Fear & Greed: {value} ({label})")
+        return value, label
+    except Exception as e:
+        print(f"  Fear & Greed: fetch error — {e}")
+        return None, None
 
 # ── Signal labels ─────────────────────────────────────────────────────────────
 
@@ -105,20 +103,22 @@ def puell_signal(v):
     if v < 100_000_000: return "🟡 High revenue — Reduce      (0.5×)"
     return                     "🚨 Extreme      — Pause DCA   (0×)"
 
-def nvt_signal(v):
+def fng_signal(v):
     if v is None: return "N/A"
-    if v < 50:    return "🟢 Double DCA  (2×)"
-    if v < 100:   return "✅ Standard    (1×)"
-    if v < 150:   return "🟡 Reduce      (0.5×)"
-    return               "🚨 Pause DCA   (0×)"
+    if v <= 25:   return "💎 Extreme Fear — Strong DCA (3×)"
+    if v <= 40:   return "🟢 Fear         — Double DCA  (2×)"
+    if v <= 60:   return "✅ Neutral       — Standard    (1×)"
+    if v <= 75:   return "🟡 Greed        — Reduce      (0.5×)"
+    return               "🚨 Extreme Greed — Pause DCA  (0×)"
 
 # ── Report ────────────────────────────────────────────────────────────────────
 
-def build_report(price, mayer, mvrv, mvrv_date, puell, puell_date, nvt, nvt_date):
+def build_report(price, mayer, mvrv, mvrv_date, puell, puell_date, fng, fng_label):
     f2  = lambda v: f"{v:,.2f}" if v is not None else "N/A"
     f0  = lambda v: f"${v:,.0f}" if v is not None else "N/A"
-    f1  = lambda v: f"{v:,.1f}" if v is not None else "N/A"
     dtg = lambda d: f" _({d})_" if d else ""
+
+    fng_str = f"{fng} — {fng_label}" if fng is not None else "N/A"
 
     return (
         f"📊 *BTC DCA Monitor*\n"
@@ -155,13 +155,14 @@ def build_report(price, mayer, mvrv, mvrv_date, puell, puell_date, nvt, nvt_date
         f"> $100M    🚨 Pause       0×\n"
         f"```\n\n"
 
-        f"🔗 *NVT Signal* (Mkt Cap / Tx Vol){dtg(nvt_date)}\n"
-        f"Value: `{f1(nvt)}`  →  {nvt_signal(nvt)}\n"
+        f"😨 *Fear & Greed Index*\n"
+        f"Value: `{fng_str}`  →  {fng_signal(fng)}\n"
         f"```\n"
-        f"< 50       🟢 Double DCA  2×\n"
-        f"50-100     ✅ Standard    1×\n"
-        f"100-150    🟡 Reduce      0.5×\n"
-        f"> 150      🚨 Pause       0×\n"
+        f"0-25       💎 Extreme Fear  3×\n"
+        f"26-40      🟢 Fear          2×\n"
+        f"41-60      ✅ Neutral        1×\n"
+        f"61-75      🟡 Greed         0.5×\n"
+        f"76-100     🚨 Extreme Greed 0×\n"
         f"```"
     )
 
@@ -173,13 +174,13 @@ def run_monitor():
         price, mayer      = get_price_and_mayer()
         mvrv,  mvrv_date  = get_mvrv()
         puell, puell_date = get_puell()
-        nvt,   nvt_date   = get_nvt()
+        fng,   fng_label  = get_fear_and_greed()
 
         report = build_report(
             price, mayer,
             mvrv,  mvrv_date,
             puell, puell_date,
-            nvt,   nvt_date,
+            fng,   fng_label,
         )
         print(report)
         send_telegram(report)
