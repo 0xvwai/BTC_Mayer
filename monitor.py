@@ -14,76 +14,66 @@ def send_telegram_msg(message):
     except Exception as e:
         print(f"Telegram Fail: {e}")
 
-def get_mvrv_from_blockchair():
-    """從 Blockchair 獲取數據"""
+def get_btc_realized_price():
+    """從 Blockchain.info 獲取已實現價格 (全網平均持倉成本)"""
     try:
-        url = "https://api.blockchair.com/bitcoin/stats"
+        # 抓取最近 7 天的已實現價格圖表
+        url = "https://api.blockchain.info/charts/realized-price?timespan=7days&format=json"
         res = requests.get(url, timeout=15).json()
-        data = res.get('data')
-        if not data: return None, None
-        
-        m_cap = data.get('market_cap_usd', 0)
-        r_cap = data.get('realized_cap_usd', 0)
-        price = data.get('market_price_usd', 0)
-        
-        mvrv = m_cap / r_cap if r_cap > 0 else None
-        return mvrv, price
+        # 取得最後一個有效數據點
+        if 'values' in res and len(res['values']) > 0:
+            return res['values'][-1]['y']
+        return None
     except:
-        return None, None
+        return None
 
 def run_monitor():
-    print("🚀 啟動加固版監控...")
+    print("🚀 啟動雙指標同步監控...")
     try:
-        # 1. 抓取數據
-        mvrv_value, curr_price = get_mvrv_from_blockchair()
-        
-        # 如果 Blockchair 拿不到價格，用 Coinbase 補
-        if not curr_price:
-            try:
-                ex = ccxt.coinbase()
-                ticker = ex.fetch_ticker('BTC/USD')
-                curr_price = ticker.get('last')
-            except:
-                curr_price = None
+        # 1. 獲取當前價格 (Coinbase)
+        ex = ccxt.coinbase()
+        ticker = ex.fetch_ticker('BTC/USD')
+        curr_price = ticker.get('last')
 
         # 2. 計算 Mayer Multiple
-        m_value = None
-        try:
-            ex = ccxt.coinbase()
-            bars = ex.fetch_ohlcv('BTC/USD', timeframe='1d', limit=250)
-            df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
-            ma200 = df['c'].tail(200).mean()
-            if curr_price and ma200:
-                m_value = curr_price / ma200
-        except:
-            m_value = None
+        bars = ex.fetch_ohlcv('BTC/USD', timeframe='1d', limit=250)
+        df = pd.DataFrame(bars, columns=['t', 'o', 'h', 'l', 'c', 'v'])
+        ma200 = df['c'].tail(200).mean()
+        m_value = curr_price / ma200 if (curr_price and ma200) else None
 
-        # --- 安全格式化處理 (防止 NoneType 錯誤) ---
-        p_str = f"${curr_price:,.0f}" if curr_price is not None else "N/A"
-        m_str = f"{m_value:.2f}" if m_value is not None else "N/A"
-        mv_str = f"{mvrv_value:.2f}" if mvrv_value is not None else "N/A"
+        # 3. 獲取已實現價格並計算 MVRV
+        realized_price = get_btc_realized_price()
+        mvrv_value = curr_price / realized_price if (curr_price and realized_price) else None
+
+        # --- 格式化處理 ---
+        p_str = f"${curr_price:,.0f}" if curr_price else "N/A"
+        rp_str = f"${realized_price:,.0f}" if realized_price else "N/A"
+        m_str = f"{m_value:.2f}" if m_value else "N/A"
+        mv_str = f"{mvrv_value:.2f}" if mvrv_value else "N/A"
 
         # 狀態診斷
         m_status = "📉 低估" if m_value and m_value < 0.8 else ("📈 過熱" if m_value and m_value > 1.8 else "✅ 正常")
         mv_status = "💎 底部" if mvrv_value and mvrv_value < 1.0 else ("🚨 頂部" if mvrv_value and mvrv_value > 3.0 else "✅ 健康")
 
         report = (
-            f"📊 *BTC 雙指標監控 (加固版)*\n"
+            f"📊 *BTC 雙指標審計報告*\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"💰 當前價格: `{p_str}`\n\n"
+            f"💰 當前市價: `{p_str}`\n"
+            f"🏠 平均成本: `{rp_str}`\n\n"
             f"📈 *Mayer Multiple*\n"
             f"數值: `{m_str}` ({m_status})\n\n"
             f"⛓️ *MVRV Ratio*\n"
             f"數值: `{mv_str}`\n"
             f"狀態: {mv_status}\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"📢 *建議*: 數據僅供參考，請維持紀律。"
+            f"📢 *操作建議*: \n"
+            f"{'🚀 雙指標共振低估，強烈建議加碼！' if (m_value and m_value < 0.8 and mvrv_value and mvrv_value < 1.2) else '☕ 目前數據穩定，繼續執行基礎定投。'}"
         )
         
         send_telegram_msg(report)
 
     except Exception as e:
-        send_telegram_msg(f"❌ 核心邏輯出錯: `{str(e)}`")
+        send_telegram_msg(f"❌ 系統錯誤: `{str(e)}`")
 
 if __name__ == "__main__":
     run_monitor()
