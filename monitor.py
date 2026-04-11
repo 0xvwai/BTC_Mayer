@@ -1,8 +1,6 @@
 import ccxt
 import pandas as pd
 import requests
-import subprocess
-import json
 import os
 
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
@@ -16,51 +14,33 @@ def send_telegram_msg(message):
     except:
         pass
 
-def fetch_via_os_curl(url):
-    """使用 Linux 系統底層的 curl 指令，繞過 Python 的特徵阻擋"""
-    cmd = [
-        'curl', '-s', 
-        '-H', 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        '-H', 'Accept: application/json',
-        '-H', 'Accept-Language: en-US,en;q=0.9',
-        url
-    ]
+def get_fear_and_greed():
+    """獲取市場恐懼與貪婪指數 (100% 穩定，無 IP 限制)"""
     try:
-        # 呼叫系統指令執行抓取
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        url = "https://api.alternative.me/fng/?limit=1"
+        res = requests.get(url, timeout=10).json()
+        data = res['data'][0]
+        value = int(data['value'])
         
-        # 確保回傳的是正常的 JSON 格式 (而不是防火牆的 HTML 警告)
-        if result.returncode == 0 and '{' in result.stdout:
-            data = json.loads(result.stdout)
-            if 'values' in data and len(data['values']) > 0:
-                return float(data['values'][-1]['y']), None
-        return None, f"被防火牆攔截或回傳空值: {result.stdout[:40]}..."
+        # 繁體中文狀態翻譯
+        classification = data['value_classification']
+        if classification == "Extreme Fear": status = "🥶 極度恐慌 (撿便宜)"
+        elif classification == "Fear": status = "😨 恐慌"
+        elif classification == "Neutral": status = "😐 中立"
+        elif classification == "Greed": status = "😏 貪婪"
+        elif classification == "Extreme Greed": status = "🤑 極度貪婪 (危險)"
+        else: status = classification
+        
+        return value, status
     except Exception as e:
-        return None, f"系統執行錯誤: {str(e)}"
-
-def get_onchain_metrics(curr_price):
-    errors = []
-    
-    # 方案 A: 直接抓 MVRV 比例
-    mvrv_url = "https://api.blockchain.info/charts/mvrv-ratio?format=json&timespan=5days"
-    mvrv, err = fetch_via_os_curl(mvrv_url)
-    if mvrv:
-        return mvrv, "Blockchain.info (OS Bypass)"
-    errors.append(f"A方案: {err}")
-
-    # 方案 B: 抓平均成本 (Realized Price) 自己算
-    rp_url = "https://api.blockchain.info/charts/realized-price?format=json&timespan=5days"
-    r_price, err = fetch_via_os_curl(rp_url)
-    if r_price and r_price > 0:
-        return curr_price / r_price, "Realized Price (OS Bypass)"
-    errors.append(f"B方案: {err}")
-
-    return None, " | ".join(errors)
+        return None, f"獲取失敗: {str(e)}"
 
 def run_monitor():
-    print("🚀 啟動 OS 級別穿透監控...")
     try:
-        # 1. 抓取價格與 Mayer Multiple
+        # 1. 抓取 Fear & Greed Index
+        fng_value, fng_class = get_fear_and_greed()
+
+        # 2. 抓取價格與 Mayer Multiple
         ex = ccxt.coinbase()
         curr_price = float(ex.fetch_ticker('BTC/USD')['last'])
         
@@ -69,36 +49,33 @@ def run_monitor():
         ma200 = df['c'].tail(200).mean()
         m_value = curr_price / ma200 if ma200 else None
 
-        # 2. 獲取鏈上 MVRV 數據
-        mvrv_value, source_info = get_onchain_metrics(curr_price)
-
         # --- 格式化顯示 ---
         p_str = f"${curr_price:,.0f}" if curr_price else "N/A"
         m_str = f"{m_value:.2f}" if m_value else "N/A"
-        mv_str = f"{mvrv_value:.2f}" if mvrv_value else "N/A"
+        f_str = f"{fng_value}/100" if fng_value else "N/A"
 
-        # 狀態診斷
+        # Mayer Multiple 狀態診斷
         m_status = "📉 低估" if m_value and m_value < 0.8 else ("📈 過熱" if m_value and m_value > 1.8 else "✅ 正常")
-        mv_status = "💎 底部" if mvrv_value and mvrv_value < 1.0 else ("🚨 頂部" if mvrv_value and mvrv_value > 3.0 else "✅ 健康")
 
         # --- 報告生成 ---
         report = (
-            f"📊 *BTC 雙指標審計 (OS穿透版)*\n"
+            f"📊 *BTC 雙指標審計 (F&G 情緒版)*\n"
             f"━━━━━━━━━━━━━━━\n"
             f"💰 當前價格: `{p_str}`\n\n"
-            f"📈 *Mayer Multiple*\n"
+            f"📈 *Mayer Multiple (價格動能)*\n"
             f"數值: `{m_str}` ({m_status})\n\n"
-            f"⛓️ *MVRV Ratio*\n"
-            f"數值: `{mv_str}`\n"
-            f"狀態: {mv_status}\n"
+            f"🧭 *Fear & Greed (市場情緒)*\n"
+            f"指數: `{f_str}`\n"
+            f"狀態: {fng_class}\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"📍 *系統日誌*:\n`{source_info}`"
+            f"📢 *核心操作建議*: \n"
+            f"{'🚀 價格低估且市場極度恐慌，這是黃金加碼點！(3.0x)' if (m_value and m_value < 0.8 and fng_value and fng_value < 25) else '☕ 目前數據未見極端，維持基準定投 (1.0x)。'}"
         )
         
         send_telegram_msg(report)
 
     except Exception as e:
-        send_telegram_msg(f"❌ 系統崩潰: `{str(e)}`")
+        send_telegram_msg(f"❌ 系統錯誤: `{str(e)}`")
 
 if __name__ == "__main__":
     run_monitor()
