@@ -1,6 +1,1 @@
-        # Fetch market cap and transaction value as separate calls
-        cap_mrkt_cur_usd = self.fetch_metrics("CapMrktCurUSD")
-        tx_tfr_val_adj_usd = self.fetch_metrics("TxTfrValAdjUSD")
-        # Combine the results as needed
-        combined_result = (cap_mrkt_cur_usd, tx_tfr_val_adj_usd)
-        return combined_result
+    df_ntv = fetch_metrics("CapMrktCurUSD")\n    df_txa = fetch_metrics("TxTfrValAdjUSD")\n    df_combined = df_ntv.join(df_txa, on="Date", lsuffix="_ntv", rsuffix="_txa")
