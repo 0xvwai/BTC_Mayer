@@ -2,13 +2,16 @@ import ccxt
 import pandas as pd
 import requests
 import os
+import time
 
+# --- 核心配置 ---
 TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
-# 模擬瀏覽器標頭，防止被雲端防火牆攔截
+# 模擬真實瀏覽器，防止 GitHub Actions IP 被擋
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json'
 }
 
 def send_telegram_msg(message):
@@ -19,36 +22,39 @@ def send_telegram_msg(message):
     except:
         pass
 
-def get_btc_metrics():
-    """多重數據源備援機制"""
-    # 方案 A: CoinMetrics (目前最穩)
+def fetch_onchain_data():
+    """核查並抓取鏈上數據：優先抓取 MVRV Ratio，備援為 Realized Price 計算"""
+    # 方案 A: Blockchain.info MVRV 接口
     try:
-        url = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&metrics=CapMrktCurUSD,CapRealUSD&limit=1"
+        print("🔎 執行數據源 A (Blockchain.info MVRV)...")
+        url = "https://api.blockchain.info/charts/mvrv-ratio?format=json&timespan=5days"
         res = requests.get(url, headers=HEADERS, timeout=15).json()
-        data = res['data'][0]
-        m_cap = float(data['CapMrktCurUSD'])
-        r_cap = float(data['CapRealUSD'])
-        return m_cap / r_cap, m_cap
-    except:
-        print("CoinMetrics failed, trying fallback...")
+        if 'values' in res and len(res['values']) > 0:
+            return float(res['values'][-1]['y']), "Blockchain.info"
+    except Exception as e:
+        print(f"A 失敗: {e}")
 
-    # 方案 B: Blockchain.info
+    # 方案 B: 計算模式 (Coinbase Price / Blockchain Realized Price)
     try:
-        url = "https://api.blockchain.info/charts/realized-price?timespan=1days&format=json"
+        print("🔎 執行數據源 B (Realized Price Calculation)...")
+        url = "https://api.blockchain.info/charts/realized-price?format=json&timespan=5days"
         res = requests.get(url, headers=HEADERS, timeout=15).json()
-        r_price = res['values'][-1]['y']
-        # 需配合當前市價計算
-        ex = ccxt.coinbase()
-        price = ex.fetch_ticker('BTC/USD')['last']
-        return price / r_price, None
-    except:
-        return None, None
+        if 'values' in res and len(res['values']) > 0:
+            realized_price = float(res['values'][-1]['y'])
+            # 獲取市價
+            ex = ccxt.coinbase()
+            curr_price = ex.fetch_ticker('BTC/USD')['last']
+            return curr_price / realized_price, "Manual Calculation"
+    except Exception as e:
+        print(f"B 失敗: {e}")
+
+    return None, "All Sources Failed"
 
 def run_monitor():
-    print("🚀 啟動終極備援監控...")
+    print("🚀 啟動雙指標審計...")
     try:
-        # 1. 獲取 MVRV
-        mvrv_value, m_cap = get_btc_metrics()
+        # 1. 抓取 MVRV
+        mvrv_value, source_name = fetch_onchain_data()
 
         # 2. 獲取價格與 200MA (Mayer Multiple)
         ex = ccxt.coinbase()
@@ -60,33 +66,48 @@ def run_monitor():
         ma200 = df['c'].tail(200).mean()
         m_value = curr_price / ma200 if ma200 else None
 
-        # --- 格式化 ---
+        # --- 數據安全格式化 ---
         p_str = f"${curr_price:,.0f}" if curr_price else "N/A"
         m_str = f"{m_value:.2f}" if m_value else "N/A"
         mv_str = f"{mvrv_value:.2f}" if mvrv_value else "N/A"
 
-        # 狀態診斷
-        m_status = "📉 低估" if m_value and m_value < 0.8 else ("📈 過熱" if m_value and m_value > 1.8 else "✅ 正常")
-        mv_status = "💎 底部" if mvrv_value and mvrv_value < 1.0 else ("🚨 頂部" if mvrv_value and mvrv_value > 3.0 else "✅ 健康")
+        # --- 策略分級診斷 ---
+        # Mayer Multiple 分級
+        if m_value:
+            m_status = "📉 低估" if m_value < 0.8 else ("📈 過熱" if m_value > 1.8 else "✅ 正常")
+        else:
+            m_status = "數據異常"
 
+        # MVRV 分級 (業界標準級別)
+        if mvrv_value:
+            if mvrv_value < 1.0: mv_status, advice = "💎 歷史大底", "🔥 全力加碼 (3.0x)"
+            elif mvrv_value < 1.2: mv_status, advice = "🛒 價值低估", "📈 穩定加碼 (1.5x)"
+            elif mvrv_value > 3.0: mv_status, advice = "🚨 泡沫區間", "🛑 停止定投/止盈"
+            elif mvrv_value > 2.4: mv_status, advice = "⚠️ 局部過熱", "📉 減碼觀望 (0.5x)"
+            else: mv_status, advice = "✅ 估值合理", "☕ 基準定投 (1.0x)"
+        else:
+            mv_status, advice = "無法診斷", "請檢查數據源"
+
+        # --- 報告生成 ---
         report = (
-            f"📊 *BTC 雙指標終極報告*\n"
+            f"📊 *BTC 策略審計報告*\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"💰 當前市價: `{p_str}`\n\n"
-            f"📈 *Mayer Multiple*\n"
-            f"數值: `{m_str}` ({m_status})\n\n"
-            f"⛓️ *MVRV Ratio*\n"
+            f"💰 市場價格: `{p_str}`\n\n"
+            f"📈 *Mayer Multiple (動能)*\n"
+            f"數值: `{m_str}`\n"
+            f"狀態: {m_status}\n\n"
+            f"⛓️ *MVRV Ratio (價值)*\n"
             f"數值: `{mv_str}`\n"
             f"狀態: {mv_status}\n"
             f"━━━━━━━━━━━━━━━\n"
-            f"📢 *核心建議*: \n"
-            f"{'🚀 雙指標共振低估，這是歷史級買點！' if (m_value and m_value < 0.8 and mvrv_value and mvrv_value < 1.2) else '☕ 數據穩定，維持定投紀律。'}"
+            f"📢 *核心建議*: \n*{advice}*\n\n"
+            f"📍 數據來源: {source_name}"
         )
         
         send_telegram_msg(report)
 
     except Exception as e:
-        send_telegram_msg(f"❌ 嚴重錯誤: `{str(e)}`")
+        send_telegram_msg(f"❌ 嚴重審計錯誤: `{str(e)}`")
 
 if __name__ == "__main__":
     run_monitor()
