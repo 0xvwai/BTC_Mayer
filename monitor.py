@@ -12,14 +12,14 @@ CM_HDR   = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
 # ── Strategy constants ────────────────────────────────────────────────────────
 BASE_WEEKLY_DCA = 250   # your neutral weekly DCA amount in USD
 
-# Optimised weights
-#   MVRV: 33%  |  AHR999: 33%  |  Mayer: 11%  |  Miner: 11%  |  Fear & Greed: 11%
-W_MVRV   = 1.5
-W_AHR999 = 1.5
-W_MAYER  = 0.5
-W_MINER  = 0.5
-W_FNG    = 0.5
-MAX_SCORE = (4*W_MVRV) + (4*W_AHR999) + (4*W_MAYER) + (4*W_MINER) + (4*W_FNG)  # 18.0
+# Option A weights
+#   MVRV: 32%  |  AHR999: 32%  |  Miner: 21%  |  F&G: 11%  |  Mayer: 5%
+W_MVRV   = 1.50
+W_AHR999 = 1.50
+W_MINER  = 1.00
+W_FNG    = 0.50
+W_MAYER  = 0.25
+MAX_SCORE = (4*W_MVRV) + (4*W_AHR999) + (4*W_MINER) + (4*W_FNG) + (4*W_MAYER)  # 19.0
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -33,9 +33,10 @@ def send_telegram(text):
         print(f"Telegram error: {e}")
 
 
-# ── CoinMetrics ───────────────────────────────────────────────────────────────
+# ── CoinMetrics generic fetcher ───────────────────────────────────────────────
 
 def cm_fetch(metric, page_size=10):
+    """Fetch the most recent non-null value for a single CoinMetrics metric."""
     url = f"{CM_BASE}?assets=btc&metrics={metric}&frequency=1d&page_size={page_size}"
     try:
         resp = requests.get(url, headers=CM_HDR, timeout=15)
@@ -74,7 +75,53 @@ def get_mvrv():
     return None, None
 
 def get_miner_revenue():
-    return cm_fetch("IssTotUSD")
+    """
+    Fetch 370 days of RevUSD (total miner revenue incl. block subsidy + fees).
+    Returns (ratio, today_rev, ma365, date) where:
+      ratio     = today_RevUSD / 365d_MA  — the value that is scored
+      today_rev = raw USD revenue today   — shown in report for context
+      ma365     = trailing 365-day MA     — shown in report for context
+
+    This approach is halving-agnostic: a ratio of 1.0 always means average
+    miner health regardless of the current subsidy era. Using RevUSD (not
+    IssTotUSD) ensures transaction fees are included in the revenue figure.
+    """
+    url = (
+        f"{CM_BASE}?assets=btc&metrics=RevUSD"
+        f"&frequency=1d&page_size=370"
+    )
+    try:
+        resp = requests.get(url, headers=CM_HDR, timeout=15)
+        resp.raise_for_status()
+        data   = resp.json().get("data", [])
+        rows   = [
+            (float(r["RevUSD"]), r.get("time", "")[:10])
+            for r in data if r.get("RevUSD") is not None
+        ]
+
+        if len(rows) < 30:
+            print(f"  RevUSD: insufficient data ({len(rows)} rows)")
+            return None, None, None, None
+
+        values     = [v for v, _ in rows]
+        today_rev  = values[-1]
+        today_date = rows[-1][1]
+
+        # 365-day MA over the days *preceding* today to avoid look-ahead
+        window = min(365, len(values) - 1)
+        ma365  = float(np.mean(values[-window - 1:-1]))
+
+        ratio = today_rev / ma365 if ma365 > 0 else None
+        print(
+            f"  RevUSD: ${today_rev:,.0f} | "
+            f"MA365: ${ma365:,.0f} | "
+            f"Ratio: {ratio:.3f} ({today_date})"
+        )
+        return ratio, today_rev, ma365, today_date
+
+    except Exception as e:
+        print(f"  RevUSD: fetch error — {e}")
+        return None, None, None, None
 
 def get_fear_and_greed():
     try:
@@ -92,11 +139,9 @@ def get_fear_and_greed():
 
 # ── AHR999 helpers ────────────────────────────────────────────────────────────
 # AHR999 = (price / exp_regression_price) × (price / 730d_MA)
-# Values above 1 indicate premium vs both long-term trend and 2yr average.
 # Primary source: CoinMetrics PriceUSD | Fallback: CoinGecko
 
 def _fetch_prices_coinmetrics(days=1500):
-    """Fetch up to `days` daily closing prices from CoinMetrics."""
     url = (
         f"{CM_BASE}?assets=btc&metrics=PriceUSD"
         f"&frequency=1d&page_size={days}"
@@ -117,7 +162,6 @@ def _fetch_prices_coinmetrics(days=1500):
         return None
 
 def _fetch_prices_coingecko(days=1500):
-    """Fallback: fetch daily prices from CoinGecko free API."""
     url = (
         "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
         f"?vs_currency=usd&days={days}&interval=daily"
@@ -135,11 +179,8 @@ def _fetch_prices_coingecko(days=1500):
 
 def get_ahr999(price):
     """
-    Compute AHR999 using live BTC price.
-      • 730-day (2-year) moving average for the MA component.
-      • Exponential regression over all available history for the trend component.
-      • Primary: CoinMetrics  |  Fallback: CoinGecko
-    Returns (ahr999_value, data_source_label) or (None, None) on failure.
+    AHR999 = (price / exp_regression_price) × (price / 730d_MA)
+    Primary: CoinMetrics | Fallback: CoinGecko
     """
     prices = _fetch_prices_coinmetrics()
     source = "CoinMetrics"
@@ -154,17 +195,15 @@ def get_ahr999(price):
 
     prices = np.array(prices, dtype=float)
 
-    # ── 730-day MA (2-year) ───────────────────────────────────────────────────
+    # 730-day MA (2-year)
     ma730 = float(np.mean(prices[-730:]))
 
-    # ── Exponential regression ────────────────────────────────────────────────
-    # Fit log(price) = a + b*t on the full history, predict for the next step
-    # (i.e. today's live price vs where the trend says it should be).
+    # Exponential regression over all available history
     n      = len(prices)
     x      = np.arange(n, dtype=float)
     log_p  = np.log(prices)
     coeffs = np.polyfit(x, log_p, 1)          # [slope, intercept]
-    # today's index = n (one step beyond the last historical close)
+    # Predict for index n (today's live price, one step beyond last close)
     exp_price = float(np.exp(coeffs[0] * n + coeffs[1]))
 
     ahr999 = (price / exp_price) * (price / ma730)
@@ -178,7 +217,7 @@ def get_ahr999(price):
 # ── Individual scorers (0–4 pts each) ────────────────────────────────────────
 
 def score_mvrv(v):
-    """MVRV Ratio — weight 1.5× (33%). Most predictive of cycle position."""
+    """MVRV Ratio — weight 1.5× (32%). On-chain cost basis vs market cap."""
     if v is None: return None, "N/A", "?"
     if v < 1.0:   return 4, "Extreme undervalue  — Accumulate aggressively", "DIAMOND"
     if v < 1.5:   return 3, "Undervalue          — Accumulate", "GREEN"
@@ -187,7 +226,7 @@ def score_mvrv(v):
     return               0, "Extreme overvalue   — Minimise", "RED"
 
 def score_ahr999(v):
-    """AHR999 — weight 1.5× (33%). Long-term trend × 2yr MA composite."""
+    """AHR999 — weight 1.5× (32%). Exp. growth trend × 2yr MA composite."""
     if v is None: return None, "N/A", "?"
     if v < 0.45:  return 4, "Deep undervalue     — Accumulate aggressively", "DIAMOND"
     if v < 1.0:   return 3, "Undervalue          — Accumulate", "GREEN"
@@ -195,32 +234,35 @@ def score_ahr999(v):
     if v < 2.5:   return 1, "Overvalue           — Reduce", "YELLOW"
     return               0, "Extreme overvalue   — Minimise", "RED"
 
-def score_mayer(v):
-    """Mayer Multiple (Price / 200DMA) — weight 0.5× (11%). Trend deviation."""
-    if v is None: return None, "N/A", "?"
-    if v < 0.80:  return 4, "Deep below 200DMA   — Accumulate aggressively", "DIAMOND"
-    if v < 1.00:  return 3, "Below 200DMA        — Accumulate", "GREEN"
-    if v < 1.30:  return 2, "Near 200DMA         — Standard DCA", "CHECK"
-    if v < 1.50:  return 1, "Above 200DMA        — Reduce", "YELLOW"
-    return               0, "Significantly above — Minimise", "RED"
-
 def score_miner(v):
-    """Miner Daily Revenue — weight 0.5× (11%). Supply-side stress signal."""
-    if v is None:       return None, "N/A", "?"
-    if v < 10_000_000:  return 4, "Miner distress      — Accumulate aggressively", "DIAMOND"
-    if v < 20_000_000:  return 3, "Below-avg revenue   — Accumulate", "GREEN"
-    if v < 50_000_000:  return 2, "Normal revenue      — Standard DCA", "CHECK"
-    if v < 100_000_000: return 1, "High revenue        — Reduce", "YELLOW"
-    return                     0, "Peak revenue        — Minimise", "RED"
+    """
+    Miner Revenue Ratio (RevUSD / 365d MA) — weight 1.0× (21%).
+    Halving-agnostic: 1.0 = average health regardless of subsidy era.
+    """
+    if v is None: return None, "N/A", "?"
+    if v < 0.50:  return 4, "Severe distress     — Accumulate aggressively", "DIAMOND"
+    if v < 0.85:  return 3, "Below-avg revenue   — Accumulate", "GREEN"
+    if v < 1.25:  return 2, "Normal revenue      — Standard DCA", "CHECK"
+    if v < 1.75:  return 1, "Elevated revenue    — Reduce", "YELLOW"
+    return               0, "Peak revenue        — Minimise", "RED"
 
 def score_fng(v):
-    """Fear & Greed Index — weight 0.5× (11%). Sentiment signal."""
+    """Fear & Greed Index — weight 0.5× (11%). Short-term sentiment signal."""
     if v is None: return None, "N/A", "?"
     if v <= 20:   return 4, "Extreme Fear        — Accumulate aggressively", "DIAMOND"
     if v <= 40:   return 3, "Fear                — Accumulate", "GREEN"
     if v <= 55:   return 2, "Neutral             — Standard DCA", "CHECK"
     if v <= 75:   return 1, "Greed               — Reduce", "YELLOW"
     return               0, "Extreme Greed       — Minimise", "RED"
+
+def score_mayer(v):
+    """Mayer Multiple (Price / 200DMA) — weight 0.25× (5%). Trend deviation."""
+    if v is None: return None, "N/A", "?"
+    if v < 0.80:  return 4, "Deep below 200DMA   — Accumulate aggressively", "DIAMOND"
+    if v < 1.00:  return 3, "Below 200DMA        — Accumulate", "GREEN"
+    if v < 1.30:  return 2, "Near 200DMA         — Standard DCA", "CHECK"
+    if v < 1.50:  return 1, "Above 200DMA        — Reduce", "YELLOW"
+    return               0, "Significantly above — Minimise", "RED"
 
 ICONS = {
     "DIAMOND": "💎", "GREEN": "🟢", "CHECK": "✅",
@@ -230,9 +272,9 @@ ICONS = {
 
 # ── Composite score ───────────────────────────────────────────────────────────
 
-def composite_score(mvrv_raw, ahr999_raw, mayer_raw, miner_raw, fng_raw):
+def composite_score(mvrv_raw, ahr999_raw, miner_raw, fng_raw, mayer_raw):
     """
-    Weighted composite out of 18.  Missing indicators are excluded and
+    Weighted composite out of 19.  Missing indicators are excluded and
     the score is renormalised so gaps do not deflate the result.
     """
     score     = 0.0
@@ -240,9 +282,9 @@ def composite_score(mvrv_raw, ahr999_raw, mayer_raw, miner_raw, fng_raw):
     pairs = [
         (mvrv_raw,   W_MVRV,   "MVRV"),
         (ahr999_raw, W_AHR999, "AHR999"),
-        (mayer_raw,  W_MAYER,  "Mayer"),
         (miner_raw,  W_MINER,  "Miner"),
         (fng_raw,    W_FNG,    "F&G"),
+        (mayer_raw,  W_MAYER,  "Mayer"),
     ]
     for raw, weight, name in pairs:
         if raw is not None:
@@ -263,15 +305,15 @@ def composite_score(mvrv_raw, ahr999_raw, mayer_raw, miner_raw, fng_raw):
 
 def dca_decision(score, base=BASE_WEEKLY_DCA):
     """
-    Maps composite score (0-18) to multiplier and dollar amount.
+    Maps composite score (0-19) to multiplier and dollar amount.
     Range: 0.25x - 2x  (neutral = 1x = $250/week)
     """
     if score is None:
         return None, None, "WARNING: Insufficient data", "N/A"
 
-    if score >= 15:
+    if score >= 16:
         mult, action = 2.00, "STRONG ACCUMULATE"
-    elif score >= 11:
+    elif score >= 12:
         mult, action = 1.50, "ACCUMULATE"
     elif score >= 6:
         mult, action = 1.00, "NEUTRAL"
@@ -293,7 +335,7 @@ def score_bar(raw, max_raw=4):
     return "█" * filled + "░" * (max_raw - filled)
 
 def weighted_pts(raw, weight):
-    return f"{raw * weight:.1f}" if raw is not None else "N/A"
+    return f"{raw * weight:.2f}" if raw is not None else "N/A"
 
 def action_icon(action):
     mapping = {
@@ -312,26 +354,33 @@ def build_report(
     price, mayer,
     mvrv, mvrv_date,
     ahr999, ahr999_src,
-    miner, miner_date,
+    miner_ratio, miner_rev, miner_ma365, miner_date,
     fng, fng_label,
 ):
-    f2  = lambda v: f"{v:,.4f}" if v is not None else "N/A"
     f2s = lambda v: f"{v:,.2f}"  if v is not None else "N/A"
+    f4  = lambda v: f"{v:,.4f}"  if v is not None else "N/A"
+    f3  = lambda v: f"{v:,.3f}"  if v is not None else "N/A"
     f0  = lambda v: f"${v:,.0f}" if v is not None else "N/A"
     dtg = lambda d: f" _({d})_"  if d else ""
 
     mvrv_pts,   mvrv_lbl,   mvrv_ico   = score_mvrv(mvrv)
     ahr999_pts, ahr999_lbl, ahr999_ico = score_ahr999(ahr999)
-    mayer_pts,  mayer_lbl,  mayer_ico  = score_mayer(mayer)
-    miner_pts,  miner_lbl,  miner_ico  = score_miner(miner)
+    miner_pts,  miner_lbl,  miner_ico  = score_miner(miner_ratio)
     fng_pts,    fng_lbl2,   fng_ico    = score_fng(fng)
+    mayer_pts,  mayer_lbl,  mayer_ico  = score_mayer(mayer)
 
-    comp_score, comp_pct             = composite_score(mvrv_pts, ahr999_pts, mayer_pts, miner_pts, fng_pts)
+    comp_score, comp_pct             = composite_score(mvrv_pts, ahr999_pts, miner_pts, fng_pts, mayer_pts)
     mult, dollar, action, mult_label = dca_decision(comp_score)
 
-    fng_str    = f"{fng} — {fng_label}" if fng is not None else "N/A"
-    comp_str   = f"{comp_score:.1f} / 18.0  ({comp_pct}%)" if comp_score is not None else "N/A"
-    ahr_src_str = f" _[{ahr999_src}]_" if ahr999_src else ""
+    fng_str  = f"{fng} — {fng_label}" if fng is not None else "N/A"
+    comp_str = f"{comp_score:.1f} / 19.0  ({comp_pct}%)" if comp_score is not None else "N/A"
+    ahr_src  = f" _[{ahr999_src}]_" if ahr999_src else ""
+
+    # Miner: show ratio + raw context on same line
+    miner_val_str = (
+        f"`{f3(miner_ratio)}`  _(today {f0(miner_rev)} vs MA365 {f0(miner_ma365)})_"
+        if miner_ratio is not None else "`N/A`"
+    )
 
     ico = lambda k: ICONS.get(k, "❓")
 
@@ -343,8 +392,8 @@ def build_report(
         f"*INDICATORS  (raw pts × weight = contribution)*\n\n"
 
         # ── MVRV ──────────────────────────────────────────────────────────────
-        f"⛓️ *MVRV Ratio*{dtg(mvrv_date)}  _(weight 1.5× — 33%)_\n"
-        f"Value: `{f2s(mvrv)}`  |  Score: `{score_bar(mvrv_pts)} {mvrv_pts}/4`  |  Pts: `{weighted_pts(mvrv_pts, W_MVRV)}/6`\n"
+        f"⛓️ *MVRV Ratio*{dtg(mvrv_date)}  _(weight 1.5× — 32%)_\n"
+        f"Value: `{f2s(mvrv)}`  |  Score: `{score_bar(mvrv_pts)} {mvrv_pts}/4`  |  Pts: `{weighted_pts(mvrv_pts, W_MVRV)}/6.00`\n"
         f"Signal: {ico(mvrv_ico)} _{mvrv_lbl}_\n"
         f"```\n"
         f"< 1.0      💎 4 pts  Extreme undervalue\n"
@@ -355,8 +404,8 @@ def build_report(
         f"```\n\n"
 
         # ── AHR999 ────────────────────────────────────────────────────────────
-        f"🔭 *AHR999*{ahr_src_str}  _(weight 1.5× — 33%)_\n"
-        f"Value: `{f2(ahr999)}`  |  Score: `{score_bar(ahr999_pts)} {ahr999_pts}/4`  |  Pts: `{weighted_pts(ahr999_pts, W_AHR999)}/6`\n"
+        f"🔭 *AHR999*{ahr_src}  _(weight 1.5× — 32%)_\n"
+        f"Value: `{f4(ahr999)}`  |  Score: `{score_bar(ahr999_pts)} {ahr999_pts}/4`  |  Pts: `{weighted_pts(ahr999_pts, W_AHR999)}/6.00`\n"
         f"Signal: {ico(ahr999_ico)} _{ahr999_lbl}_\n"
         f"```\n"
         f"< 0.45     💎 4 pts  Deep undervalue\n"
@@ -367,33 +416,23 @@ def build_report(
         f"```\n"
         f"_Formula: (price/exp-regression) × (price/730d-MA)_\n\n"
 
-        # ── Mayer ─────────────────────────────────────────────────────────────
-        f"📈 *Mayer Multiple*  _(weight 0.5× — 11%)_\n"
-        f"Value: `{f2s(mayer)}`  |  Score: `{score_bar(mayer_pts)} {mayer_pts}/4`  |  Pts: `{weighted_pts(mayer_pts, W_MAYER)}/2`\n"
-        f"Signal: {ico(mayer_ico)} _{mayer_lbl}_\n"
-        f"```\n"
-        f"< 0.80     💎 4 pts  Deep below 200DMA\n"
-        f"0.80-1.00  🟢 3 pts  Below 200DMA\n"
-        f"1.00-1.30  ✅ 2 pts  Near 200DMA\n"
-        f"1.30-1.50  🟡 1 pt   Above 200DMA\n"
-        f"> 1.50     🚨 0 pts  Significantly above\n"
-        f"```\n\n"
-
-        # ── Miner ─────────────────────────────────────────────────────────────
-        f"⛏️ *Miner Daily Revenue*{dtg(miner_date)}  _(weight 0.5× — 11%)_\n"
-        f"Value: `{f0(miner)}`  |  Score: `{score_bar(miner_pts)} {miner_pts}/4`  |  Pts: `{weighted_pts(miner_pts, W_MINER)}/2`\n"
+        # ── Miner Revenue ─────────────────────────────────────────────────────
+        f"⛏️ *Miner Revenue Ratio*{dtg(miner_date)}  _(weight 1.0× — 21%)_\n"
+        f"Ratio: {miner_val_str}\n"
+        f"Score: `{score_bar(miner_pts)} {miner_pts}/4`  |  Pts: `{weighted_pts(miner_pts, W_MINER)}/4.00`\n"
         f"Signal: {ico(miner_ico)} _{miner_lbl}_\n"
         f"```\n"
-        f"< $10M     💎 4 pts  Miner distress\n"
-        f"$10-20M    🟢 3 pts  Below-avg revenue\n"
-        f"$20-50M    ✅ 2 pts  Normal revenue\n"
-        f"$50-100M   🟡 1 pt   High revenue\n"
-        f"> $100M    🚨 0 pts  Peak revenue\n"
-        f"```\n\n"
+        f"< 0.50     💎 4 pts  Severe distress\n"
+        f"0.50-0.85  🟢 3 pts  Below-avg revenue\n"
+        f"0.85-1.25  ✅ 2 pts  Normal revenue\n"
+        f"1.25-1.75  🟡 1 pt   Elevated revenue\n"
+        f"> 1.75     🚨 0 pts  Peak revenue\n"
+        f"```\n"
+        f"_RevUSD (subsidy + fees) / 365d-MA — halving-agnostic_\n\n"
 
         # ── Fear & Greed ──────────────────────────────────────────────────────
         f"😨 *Fear & Greed Index*  _(weight 0.5× — 11%)_\n"
-        f"Value: `{fng_str}`  |  Score: `{score_bar(fng_pts)} {fng_pts}/4`  |  Pts: `{weighted_pts(fng_pts, W_FNG)}/2`\n"
+        f"Value: `{fng_str}`  |  Score: `{score_bar(fng_pts)} {fng_pts}/4`  |  Pts: `{weighted_pts(fng_pts, W_FNG)}/2.00`\n"
         f"Signal: {ico(fng_ico)} _{fng_lbl2}_\n"
         f"```\n"
         f"0-20       💎 4 pts  Extreme Fear\n"
@@ -401,6 +440,18 @@ def build_report(
         f"41-55      ✅ 2 pts  Neutral\n"
         f"56-75      🟡 1 pt   Greed\n"
         f"76-100     🚨 0 pts  Extreme Greed\n"
+        f"```\n\n"
+
+        # ── Mayer ─────────────────────────────────────────────────────────────
+        f"📈 *Mayer Multiple*  _(weight 0.25× — 5%)_\n"
+        f"Value: `{f2s(mayer)}`  |  Score: `{score_bar(mayer_pts)} {mayer_pts}/4`  |  Pts: `{weighted_pts(mayer_pts, W_MAYER)}/1.00`\n"
+        f"Signal: {ico(mayer_ico)} _{mayer_lbl}_\n"
+        f"```\n"
+        f"< 0.80     💎 4 pts  Deep below 200DMA\n"
+        f"0.80-1.00  🟢 3 pts  Below 200DMA\n"
+        f"1.00-1.30  ✅ 2 pts  Near 200DMA\n"
+        f"1.30-1.50  🟡 1 pt   Above 200DMA\n"
+        f"> 1.50     🚨 0 pts  Significantly above\n"
         f"```\n\n"
 
         # ── Composite + DCA ───────────────────────────────────────────────────
@@ -412,14 +463,15 @@ def build_report(
         f"➡️  `{mult_label}`\n\n"
 
         f"```\n"
-        f"Score 15-18  💎 2.00x  $500   Strong Accumulate\n"
-        f"Score 11-14  🟢 1.50x  $375   Accumulate\n"
-        f"Score  6-10  ✅ 1.00x  $250   Neutral  <- base\n"
+        f"Score 16-19  💎 2.00x  $500   Strong Accumulate\n"
+        f"Score 12-15  🟢 1.50x  $375   Accumulate\n"
+        f"Score  6-11  ✅ 1.00x  $250   Neutral  <- base\n"
         f"Score  2-5   🟡 0.50x  $125   Reduce\n"
         f"Score  0-1   🚨 0.25x  $ 63   Minimise\n"
         f"```\n"
-        f"_Weights: MVRV 33% | AHR999 33% | Mayer 11% | Miner 11% | F&G 11%_\n"
-        f"_Range 0.25x-2x | Base ${BASE_WEEKLY_DCA}/wk | AHR999 uses 2yr MA + exp regression_"
+        f"_Weights: MVRV 32% | AHR999 32% | Miner 21% | F&G 11% | Mayer 5%_\n"
+        f"_Range 0.25x-2x | Base ${BASE_WEEKLY_DCA}/wk_\n"
+        f"_Miner: RevUSD/365d-MA | AHR999: 2yr-MA + exp regression_"
     )
 
 
@@ -428,17 +480,18 @@ def build_report(
 def run_monitor():
     print("Starting BTC DCA monitor...")
     try:
-        price, mayer          = get_price_and_mayer()
-        mvrv,  mvrv_date      = get_mvrv()
-        ahr999, ahr999_src    = get_ahr999(price)
-        miner, miner_date     = get_miner_revenue()
-        fng,   fng_label      = get_fear_and_greed()
+        price, mayer                            = get_price_and_mayer()
+        mvrv,  mvrv_date                        = get_mvrv()
+        ahr999, ahr999_src                      = get_ahr999(price)
+        miner_ratio, miner_rev, miner_ma365, \
+            miner_date                          = get_miner_revenue()
+        fng,   fng_label                        = get_fear_and_greed()
 
         report = build_report(
             price, mayer,
             mvrv,  mvrv_date,
             ahr999, ahr999_src,
-            miner, miner_date,
+            miner_ratio, miner_rev, miner_ma365, miner_date,
             fng,   fng_label,
         )
         print(report)
