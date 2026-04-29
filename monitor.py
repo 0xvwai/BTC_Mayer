@@ -1,4 +1,5 @@
 import os
+import datetime
 import requests
 import ccxt
 import numpy as np
@@ -74,54 +75,114 @@ def get_mvrv():
         return mkt / real, d1
     return None, None
 
-def get_miner_revenue():
+def _fetch_miner_blockchain_com(days=400):
     """
-    Fetch 370 days of RevUSD (total miner revenue incl. block subsidy + fees).
-    Returns (ratio, today_rev, ma365, date) where:
-      ratio     = today_RevUSD / 365d_MA  — the value that is scored
-      today_rev = raw USD revenue today   — shown in report for context
-      ma365     = trailing 365-day MA     — shown in report for context
-
-    This approach is halving-agnostic: a ratio of 1.0 always means average
-    miner health regardless of the current subsidy era. Using RevUSD (not
-    IssTotUSD) ensures transaction fees are included in the revenue figure.
+    Primary miner revenue source: Blockchain.com charts API.
+    Returns list of (usd_value, date_str) tuples, oldest first.
+    Includes both block subsidy and transaction fees.
     """
     url = (
-        f"{CM_BASE}?assets=btc&metrics=RevUSD"
-        f"&frequency=1d&page_size=370"
+        f"https://api.blockchain.info/charts/miners-revenue"
+        f"?timespan={days}days&format=json&sampled=false"
     )
     try:
-        resp = requests.get(url, headers=CM_HDR, timeout=15)
+        resp = requests.get(url, timeout=20)
         resp.raise_for_status()
-        data   = resp.json().get("data", [])
-        rows   = [
-            (float(r["RevUSD"]), r.get("time", "")[:10])
-            for r in data if r.get("RevUSD") is not None
-        ]
-
-        if len(rows) < 30:
-            print(f"  RevUSD: insufficient data ({len(rows)} rows)")
-            return None, None, None, None
-
-        values     = [v for v, _ in rows]
-        today_rev  = values[-1]
-        today_date = rows[-1][1]
-
-        # 365-day MA over the days *preceding* today to avoid look-ahead
-        window = min(365, len(values) - 1)
-        ma365  = float(np.mean(values[-window - 1:-1]))
-
-        ratio = today_rev / ma365 if ma365 > 0 else None
-        print(
-            f"  RevUSD: ${today_rev:,.0f} | "
-            f"MA365: ${ma365:,.0f} | "
-            f"Ratio: {ratio:.3f} ({today_date})"
-        )
-        return ratio, today_rev, ma365, today_date
-
+        pts  = resp.json().get("values", [])
+        rows = []
+        for p in pts:
+            if p.get("y") is not None:
+                date_str = datetime.datetime.utcfromtimestamp(p["x"]).strftime("%Y-%m-%d")
+                rows.append((float(p["y"]), date_str))
+        print(f"  Miner (Blockchain.com): {len(rows)} daily rows fetched")
+        return rows if len(rows) >= 30 else None
     except Exception as e:
-        print(f"  RevUSD: fetch error — {e}")
+        print(f"  Miner (Blockchain.com) error: {e}")
+        return None
+
+def _fetch_miner_mempool_space(days=400):
+    """
+    Fallback miner revenue source: Mempool.space API.
+    Fetches daily revenue buckets (subsidy + fees) in USD.
+    Returns list of (usd_value, date_str) tuples, oldest first.
+    """
+    # Mempool.space returns up to 1y of daily mining revenue stats
+    url = "https://mempool.space/api/v1/mining/revenue/1y"
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        # Response: {"timestamps": [...], "revenue": [...]}
+        timestamps = data.get("timestamps", [])
+        revenues   = data.get("revenue", [])
+        if not timestamps or not revenues:
+            print(f"  Miner (Mempool.space): empty response")
+            return None
+        rows = []
+        for ts, rev in zip(timestamps, revenues):
+            if rev is not None:
+                date_str = datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+                rows.append((float(rev), date_str))
+        print(f"  Miner (Mempool.space): {len(rows)} daily rows fetched")
+        return rows if len(rows) >= 30 else None
+    except Exception as e:
+        print(f"  Miner (Mempool.space) error: {e}")
+        return None
+
+def _compute_miner_ratio(rows, source_label):
+    """
+    Shared normalisation logic: given list of (usd_value, date_str) tuples,
+    compute ratio = today_rev / 365d_MA (look-ahead free).
+    Returns (ratio, today_rev, ma365, today_date) or (None, None, None, None).
+    """
+    values     = [v for v, _ in rows]
+    today_rev  = values[-1]
+    today_date = rows[-1][1]
+
+    window = min(365, len(values) - 1)
+    ma365  = float(np.mean(values[-window - 1:-1]))
+
+    if ma365 <= 0:
+        print(f"  Miner ({source_label}): MA365 is zero, cannot compute ratio")
         return None, None, None, None
+
+    ratio = today_rev / ma365
+    print(
+        f"  Miner ({source_label}): ${today_rev:,.0f} | "
+        f"MA365: ${ma365:,.0f} | "
+        f"Ratio: {ratio:.3f} ({today_date})"
+    )
+    return ratio, today_rev, ma365, today_date
+
+def get_miner_revenue():
+    """
+    Fetch total miner revenue (subsidy + fees) and compute a halving-agnostic
+    ratio vs its own 365-day MA for scoring.
+
+    Source priority:
+      1. Blockchain.com charts API  (primary)
+      2. Mempool.space API          (fallback)
+
+    Returns (ratio, today_rev, ma365, date, source_label) where:
+      ratio       = today_rev / 365d_MA  — the value that is scored
+      today_rev   = raw USD revenue      — shown in report for context
+      ma365       = trailing 365d MA     — shown in report for context
+      source_label = which source was used
+    """
+    rows = _fetch_miner_blockchain_com()
+    source = "Blockchain.com"
+
+    if rows is None:
+        print("  Miner: Blockchain.com failed — trying Mempool.space...")
+        rows = _fetch_miner_mempool_space()
+        source = "Mempool.space"
+
+    if rows is None:
+        print("  Miner: all sources failed")
+        return None, None, None, None, None
+
+    ratio, today_rev, ma365, today_date = _compute_miner_ratio(rows, source)
+    return ratio, today_rev, ma365, today_date, source
 
 def get_fear_and_greed():
     try:
@@ -354,7 +415,7 @@ def build_report(
     price, mayer,
     mvrv, mvrv_date,
     ahr999, ahr999_src,
-    miner_ratio, miner_rev, miner_ma365, miner_date,
+    miner_ratio, miner_rev, miner_ma365, miner_date, miner_src,
     fng, fng_label,
 ):
     f2s = lambda v: f"{v:,.2f}"  if v is not None else "N/A"
@@ -372,9 +433,10 @@ def build_report(
     comp_score, comp_pct             = composite_score(mvrv_pts, ahr999_pts, miner_pts, fng_pts, mayer_pts)
     mult, dollar, action, mult_label = dca_decision(comp_score)
 
-    fng_str  = f"{fng} — {fng_label}" if fng is not None else "N/A"
-    comp_str = f"{comp_score:.1f} / 19.0  ({comp_pct}%)" if comp_score is not None else "N/A"
-    ahr_src  = f" _[{ahr999_src}]_" if ahr999_src else ""
+    fng_str   = f"{fng} — {fng_label}" if fng is not None else "N/A"
+    comp_str  = f"{comp_score:.1f} / 19.0  ({comp_pct}%)" if comp_score is not None else "N/A"
+    ahr_src   = f" _[{ahr999_src}]_"  if ahr999_src  else ""
+    miner_src_str = f" _[{miner_src}]_" if miner_src else ""
 
     # Miner: show ratio + raw context on same line
     miner_val_str = (
@@ -417,7 +479,7 @@ def build_report(
         f"_Formula: (price/exp-regression) × (price/730d-MA)_\n\n"
 
         # ── Miner Revenue ─────────────────────────────────────────────────────
-        f"⛏️ *Miner Revenue Ratio*{dtg(miner_date)}  _(weight 1.0× — 21%)_\n"
+        f"⛏️ *Miner Revenue Ratio*{dtg(miner_date)}{miner_src_str}  _(weight 1.0× — 21%)_\n"
         f"Ratio: {miner_val_str}\n"
         f"Score: `{score_bar(miner_pts)} {miner_pts}/4`  |  Pts: `{weighted_pts(miner_pts, W_MINER)}/4.00`\n"
         f"Signal: {ico(miner_ico)} _{miner_lbl}_\n"
@@ -428,7 +490,7 @@ def build_report(
         f"1.25-1.75  🟡 1 pt   Elevated revenue\n"
         f"> 1.75     🚨 0 pts  Peak revenue\n"
         f"```\n"
-        f"_RevUSD (subsidy + fees) / 365d-MA — halving-agnostic_\n\n"
+        f"_Revenue (subsidy + fees) / 365d-MA — halving-agnostic_\n\n"
 
         # ── Fear & Greed ──────────────────────────────────────────────────────
         f"😨 *Fear & Greed Index*  _(weight 0.5× — 11%)_\n"
@@ -471,7 +533,7 @@ def build_report(
         f"```\n"
         f"_Weights: MVRV 32% | AHR999 32% | Miner 21% | F&G 11% | Mayer 5%_\n"
         f"_Range 0.25x-2x | Base ${BASE_WEEKLY_DCA}/wk_\n"
-        f"_Miner: RevUSD/365d-MA | AHR999: 2yr-MA + exp regression_"
+        f"_Miner: Blockchain.com/Mempool.space (subsidy+fees)/365d-MA | AHR999: 2yr-MA + exp regression_"
     )
 
 
@@ -484,14 +546,14 @@ def run_monitor():
         mvrv,  mvrv_date                        = get_mvrv()
         ahr999, ahr999_src                      = get_ahr999(price)
         miner_ratio, miner_rev, miner_ma365, \
-            miner_date                          = get_miner_revenue()
+            miner_date, miner_src               = get_miner_revenue()
         fng,   fng_label                        = get_fear_and_greed()
 
         report = build_report(
             price, mayer,
             mvrv,  mvrv_date,
             ahr999, ahr999_src,
-            miner_ratio, miner_rev, miner_ma365, miner_date,
+            miner_ratio, miner_rev, miner_ma365, miner_date, miner_src,
             fng,   fng_label,
         )
         print(report)
