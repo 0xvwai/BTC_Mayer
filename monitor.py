@@ -13,14 +13,14 @@ CM_HDR   = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
 # ── Strategy constants ────────────────────────────────────────────────────────
 BASE_WEEKLY_DCA = 250   # your neutral weekly DCA amount in USD
 
-# Option A weights
-#   MVRV: 32%  |  AHR999: 32%  |  Miner: 21%  |  F&G: 11%  |  Mayer: 5%
-W_MVRV   = 1.50
-W_AHR999 = 1.50
+# Weights
+#   MVRV: 28%  |  AHR999: 28%  |  Miner: 22%  |  F&G: 17%  |  Mayer: 6%
+W_MVRV   = 1.25
+W_AHR999 = 1.25
 W_MINER  = 1.00
-W_FNG    = 0.50
+W_FNG    = 0.75
 W_MAYER  = 0.25
-MAX_SCORE = (4*W_MVRV) + (4*W_AHR999) + (4*W_MINER) + (4*W_FNG) + (4*W_MAYER)  # 19.0
+MAX_SCORE = (4*W_MVRV) + (4*W_AHR999) + (4*W_MINER) + (4*W_FNG) + (4*W_MAYER)  # 18.0
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -278,7 +278,7 @@ def get_ahr999(price):
 # ── Individual scorers (0–4 pts each) ────────────────────────────────────────
 
 def score_mvrv(v):
-    """MVRV Ratio — weight 1.5× (32%). On-chain cost basis vs market cap."""
+    """MVRV Ratio — weight 1.25× (28%). On-chain cost basis vs market cap."""
     if v is None: return None, "N/A", "?"
     if v < 1.0:   return 4, "Extreme undervalue  — Accumulate aggressively", "DIAMOND"
     if v < 1.5:   return 3, "Undervalue          — Accumulate", "GREEN"
@@ -287,7 +287,7 @@ def score_mvrv(v):
     return               0, "Extreme overvalue   — Minimise", "RED"
 
 def score_ahr999(v):
-    """AHR999 — weight 1.5× (32%). Exp. growth trend × 2yr MA composite."""
+    """AHR999 — weight 1.25× (28%). Exp. growth trend × 2yr MA composite."""
     if v is None: return None, "N/A", "?"
     if v < 0.45:  return 4, "Deep undervalue     — Accumulate aggressively", "DIAMOND"
     if v < 1.0:   return 3, "Undervalue          — Accumulate", "GREEN"
@@ -308,7 +308,7 @@ def score_miner(v):
     return               0, "Peak revenue        — Minimise", "RED"
 
 def score_fng(v):
-    """Fear & Greed Index — weight 0.5× (11%). Short-term sentiment signal."""
+    """Fear & Greed Index — weight 0.75× (17%). Short-term sentiment signal."""
     if v is None: return None, "N/A", "?"
     if v <= 20:   return 4, "Extreme Fear        — Accumulate aggressively", "DIAMOND"
     if v <= 40:   return 3, "Fear                — Accumulate", "GREEN"
@@ -335,7 +335,7 @@ ICONS = {
 
 def composite_score(mvrv_raw, ahr999_raw, miner_raw, fng_raw, mayer_raw):
     """
-    Weighted composite out of 19.  Missing indicators are excluded and
+    Weighted composite out of 18.  Missing indicators are excluded and
     the score is renormalised so gaps do not deflate the result.
     """
     score     = 0.0
@@ -366,15 +366,15 @@ def composite_score(mvrv_raw, ahr999_raw, miner_raw, fng_raw, mayer_raw):
 
 def dca_decision(score, base=BASE_WEEKLY_DCA):
     """
-    Maps composite score (0-19) to multiplier and dollar amount.
+    Maps composite score (0-18) to multiplier and dollar amount.
     Range: 0.25x - 2x  (neutral = 1x = $250/week)
     """
     if score is None:
         return None, None, "WARNING: Insufficient data", "N/A"
 
-    if score >= 16:
+    if score >= 15:
         mult, action = 2.00, "STRONG ACCUMULATE"
-    elif score >= 12:
+    elif score >= 11:
         mult, action = 1.50, "ACCUMULATE"
     elif score >= 6:
         mult, action = 1.00, "NEUTRAL"
@@ -434,7 +434,7 @@ def build_report(
     mult, dollar, action, mult_label = dca_decision(comp_score)
 
     fng_str   = f"{fng} — {fng_label}" if fng is not None else "N/A"
-    comp_str  = f"{comp_score:.1f} / 19.0  ({comp_pct}%)" if comp_score is not None else "N/A"
+    comp_str  = f"{comp_score:.1f} / 18.0  ({comp_pct}%)" if comp_score is not None else "N/A"
     ahr_src   = f" _[{ahr999_src}]_"  if ahr999_src  else ""
     miner_src_str = f" _[{miner_src}]_" if miner_src else ""
 
@@ -454,8 +454,8 @@ def build_report(
         f"*INDICATORS  (raw pts × weight = contribution)*\n\n"
 
         # ── MVRV ──────────────────────────────────────────────────────────────
-        f"⛓️ *MVRV Ratio*{dtg(mvrv_date)}  _(weight 1.5× — 32%)_\n"
-        f"Value: `{f2s(mvrv)}`  |  Score: `{score_bar(mvrv_pts)} {mvrv_pts}/4`  |  Pts: `{weighted_pts(mvrv_pts, W_MVRV)}/6.00`\n"
+        f"⛓️ *MVRV Ratio*{dtg(mvrv_date)}  _(weight 1.25× — 28%)_\n"
+        f"Value: `{f2s(mvrv)}`  |  Score: `{score_bar(mvrv_pts)} {mvrv_pts}/4`  |  Pts: `{weighted_pts(mvrv_pts, W_MVRV)}/5.00`\n"
         f"Signal: {ico(mvrv_ico)} _{mvrv_lbl}_\n"
         f"```\n"
         f"< 1.0      💎 4 pts  Extreme undervalue\n"
@@ -466,8 +466,8 @@ def build_report(
         f"```\n\n"
 
         # ── AHR999 ────────────────────────────────────────────────────────────
-        f"🔭 *AHR999*{ahr_src}  _(weight 1.5× — 32%)_\n"
-        f"Value: `{f4(ahr999)}`  |  Score: `{score_bar(ahr999_pts)} {ahr999_pts}/4`  |  Pts: `{weighted_pts(ahr999_pts, W_AHR999)}/6.00`\n"
+        f"🔭 *AHR999*{ahr_src}  _(weight 1.25× — 28%)_\n"
+        f"Value: `{f4(ahr999)}`  |  Score: `{score_bar(ahr999_pts)} {ahr999_pts}/4`  |  Pts: `{weighted_pts(ahr999_pts, W_AHR999)}/5.00`\n"
         f"Signal: {ico(ahr999_ico)} _{ahr999_lbl}_\n"
         f"```\n"
         f"< 0.45     💎 4 pts  Deep undervalue\n"
@@ -493,8 +493,8 @@ def build_report(
         f"_Revenue (subsidy + fees) / 365d-MA — halving-agnostic_\n\n"
 
         # ── Fear & Greed ──────────────────────────────────────────────────────
-        f"😨 *Fear & Greed Index*  _(weight 0.5× — 11%)_\n"
-        f"Value: `{fng_str}`  |  Score: `{score_bar(fng_pts)} {fng_pts}/4`  |  Pts: `{weighted_pts(fng_pts, W_FNG)}/2.00`\n"
+        f"😨 *Fear & Greed Index*  _(weight 0.75× — 17%)_\n"
+        f"Value: `{fng_str}`  |  Score: `{score_bar(fng_pts)} {fng_pts}/4`  |  Pts: `{weighted_pts(fng_pts, W_FNG)}/3.00`\n"
         f"Signal: {ico(fng_ico)} _{fng_lbl2}_\n"
         f"```\n"
         f"0-20       💎 4 pts  Extreme Fear\n"
@@ -505,7 +505,7 @@ def build_report(
         f"```\n\n"
 
         # ── Mayer ─────────────────────────────────────────────────────────────
-        f"📈 *Mayer Multiple*  _(weight 0.25× — 5%)_\n"
+        f"📈 *Mayer Multiple*  _(weight 0.25× — 6%)_\n"
         f"Value: `{f2s(mayer)}`  |  Score: `{score_bar(mayer_pts)} {mayer_pts}/4`  |  Pts: `{weighted_pts(mayer_pts, W_MAYER)}/1.00`\n"
         f"Signal: {ico(mayer_ico)} _{mayer_lbl}_\n"
         f"```\n"
@@ -525,13 +525,13 @@ def build_report(
         f"➡️  `{mult_label}`\n\n"
 
         f"```\n"
-        f"Score 16-19  💎 2.00x  $500   Strong Accumulate\n"
-        f"Score 12-15  🟢 1.50x  $375   Accumulate\n"
-        f"Score  6-11  ✅ 1.00x  $250   Neutral  <- base\n"
+        f"Score 15-18  💎 2.00x  $500   Strong Accumulate\n"
+        f"Score 11-14  🟢 1.50x  $375   Accumulate\n"
+        f"Score  6-10  ✅ 1.00x  $250   Neutral  <- base\n"
         f"Score  2-5   🟡 0.50x  $125   Reduce\n"
         f"Score  0-1   🚨 0.25x  $ 63   Minimise\n"
         f"```\n"
-        f"_Weights: MVRV 32% | AHR999 32% | Miner 21% | F&G 11% | Mayer 5%_\n"
+        f"_Weights: MVRV 28% | AHR999 28% | Miner 22% | F&G 17% | Mayer 6%_\n"
         f"_Range 0.25x-2x | Base ${BASE_WEEKLY_DCA}/wk_\n"
         f"_Miner: Blockchain.com/Mempool.space (subsidy+fees)/365d-MA | AHR999: 2yr-MA + exp regression_"
     )
