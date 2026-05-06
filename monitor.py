@@ -1,4 +1,5 @@
 import os
+import time
 import datetime
 import requests
 import ccxt
@@ -32,14 +33,45 @@ MAX_ETH = (4*W_ETH_MVRV) + (4*W_ETH_AHR999) + (4*W_ETH_FNG) + (4*W_ETH_MAYER)  #
 
 # ── Telegram ───────────────────────────────────────────────────────────────────
 
-def send_telegram(text):
+def send_telegram(text, parse_mode="Markdown"):
     url     = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": parse_mode}
     try:
-        requests.post(url, data=payload, timeout=10)
+        resp   = requests.post(url, data=payload, timeout=10)
+        result = resp.json()
+        if not result.get("ok"):
+            print(f"Telegram API error: {result.get('description', 'unknown')}")
+            print(f"  Error code: {result.get('error_code')}")
+        return result.get("ok", False)
     except Exception as e:
         print(f"Telegram error: {e}")
+        return False
 
+
+
+# ── Scoring reference table (module-level constant — sent as a separate message)
+# ── Scoring reference table (module-level constant — sent as a separate message)
+REFERENCE_TABLE = (
+    "📊 *Scoring Reference*\n"
+    "```\n"
+    "Indicator     4pts      3pts      2pts       1pt        0pts\n"
+    "--------------------------------------------------------------\n"
+    "MVRV  (BTC)  <1.0    1.0-1.5   1.5-2.5   2.5-3.5    >3.5\n"
+    "MVRV  (ETH)  <0.8    0.8-1.5   1.5-3.0   3.0-5.0    >5.0\n"
+    "AHR999(BTC)  <0.45   0.45-1.0  1.0-1.5   1.5-2.5    >2.5\n"
+    "AHR999(ETH)  <0.35   0.35-0.8  0.8-1.5   1.5-3.0    >3.0\n"
+    "Miner Ratio  <0.50   0.50-0.85 0.85-1.25 1.25-1.75  >1.75\n"
+    "F&G Index    <=20    21-40     41-55     56-75      76-100\n"
+    "Mayer (BTC)  <0.80   0.80-1.0  1.0-1.3   1.3-1.5    >1.5\n"
+    "Mayer (ETH)  <0.70   0.70-0.9  0.9-1.4   1.4-1.8    >1.8\n"
+    "--------------------------------------------------------------\n"
+    "DCA Mult     2.00x   1.50x     1.00x     0.50x      0.25x\n"
+    f"BTC (${BASE_BTC}/wk) $500    $375      $250      $125       $63\n"
+    f"ETH (${BASE_ETH}/wk) $250    $188      $125       $63       $31\n"
+    "```\n"
+    "_4pts=Strong Accumulate  3pts=Accumulate  2pts=Neutral_\n"
+    "_1pt=Reduce  0pts=Minimise_"
+)
 
 # ── CoinMetrics generic fetcher ────────────────────────────────────────────────
 
@@ -391,17 +423,18 @@ def action_icon(action):
 def ind_line(emoji, name, weight_str, val_str, pts, lbl, ico_key,
              src_tag="", extra=""):
     """
-    Compact single-line indicator row.
-    extra: optional context string appended after val_str (e.g. MA context).
+    Two-line indicator row: name/weight on line 1, value/score/signal on line 2.
+    Trailing blank line gives breathing room between indicators.
+    extra: optional context string shown on a sub-line (e.g. MA context).
     """
     bar   = score_bar(pts)
     pts_s = str(pts) if pts is not None else "?"
     icon  = ICONS.get(ico_key, "❓")
     src   = f" _[{src_tag}]_" if src_tag else ""
-    ext   = f"  {extra}"      if extra    else ""
+    ext   = f"\n    {extra}"  if extra    else ""
     return (
-        f"{emoji} *{name}*{src} _{weight_str}_  "
-        f"`{val_str}`{ext}  {bar} {pts_s}/4  {icon} _{lbl}_\n"
+        f"{emoji} *{name}*{src} _{weight_str}_\n"
+        f"    `{val_str}`{ext}  {bar} {pts_s}/4  {icon} _{lbl}_\n\n"
     )
 
 
@@ -473,27 +506,29 @@ def build_report(
         f"💰 BTC `${btc_price:,.0f}`  |  ETH `${eth_price:,.0f}`\n\n"
 
         # ── BTC ───────────────────────────────────────────────────────────────
-        f"*── BITCOIN ─────────────────────*\n"
-        + ind_line("⛓️", "MVRV",      "1.25×", f2s(btc_mvrv),    btc_mvrv_pts,  btc_mvrv_lbl,  btc_mvrv_ico)
-        + ind_line("🔭", "AHR999",    "1.25×", f4(btc_ahr999),   btc_ahr_pts,   btc_ahr_lbl,   btc_ahr_ico,  btc_ahr999_src or "")
+        f"*── BITCOIN ─────────────────────*\n\n"
+        + ind_line("⛓️", "MVRV",      "1.25×", f2s(btc_mvrv),       btc_mvrv_pts,  btc_mvrv_lbl,  btc_mvrv_ico)
+        + ind_line("🔭", "AHR999",    "1.25×", f4(btc_ahr999),      btc_ahr_pts,   btc_ahr_lbl,   btc_ahr_ico,   btc_ahr999_src or "")
         + ind_line("⛏️", "Miner Rev", "1.0×",  f3(btc_miner_ratio), btc_miner_pts, btc_miner_lbl, btc_miner_ico, btc_miner_src or "", miner_ctx)
-        + ind_line("😨", "F&G",       "0.75×", fng_str,          fng_pts,       fng_lbl2,      fng_ico)
-        + ind_line("📈", "Mayer",     "0.25×", f2s(btc_mayer),   btc_mayer_pts, btc_mayer_lbl, btc_mayer_ico)
-        + f"🧮 `{btc_score_str}`  →  *{btc_action}* {action_icon(btc_action)}  `{btc_mult}`\n\n"
+        + ind_line("😨", "F&G",       "0.75×", fng_str,             fng_pts,       fng_lbl2,      fng_ico)
+        + ind_line("📈", "Mayer",     "0.25×", f2s(btc_mayer),      btc_mayer_pts, btc_mayer_lbl, btc_mayer_ico)
+        + f"🧮 *Score* `{btc_score_str}`\n"
+        + f"💡 *{btc_action}* {action_icon(btc_action)}  →  `{btc_mult}`\n\n"
 
         # ── ETH ───────────────────────────────────────────────────────────────
-        f"*── ETHEREUM ────────────────────*\n"
+        f"*── ETHEREUM ────────────────────*\n\n"
         + ind_line("⛓️", "MVRV",   "1.75×", f2s(eth_mvrv),  eth_mvrv_pts,  eth_mvrv_lbl,  eth_mvrv_ico)
         + ind_line("🔭", "AHR999", "1.25×", f4(eth_ahr999), eth_ahr_pts,   eth_ahr_lbl,   eth_ahr_ico,  eth_ahr999_src or "")
         + ind_line("😨", "F&G",    "0.75×", fng_str,        fng_pts,       fng_lbl2,      fng_ico)
         + ind_line("📈", "Mayer",  "0.25×", f2s(eth_mayer), eth_mayer_pts, eth_mayer_lbl, eth_mayer_ico)
-        + f"🧮 `{eth_score_str}`  →  *{eth_action}* {action_icon(eth_action)}  `{eth_mult}`\n\n"
+        + f"🧮 *Score* `{eth_score_str}`\n"
+        + f"💡 *{eth_action}* {action_icon(eth_action)}  →  `{eth_mult}`\n\n"
+
 
         # ── Footer ────────────────────────────────────────────────────────────
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"_BTC: MVRV 28% | AHR999 28% | Miner 22% | F&G 17% | Mayer 6%_\n"
         f"_ETH: MVRV 44% | AHR999 31% | F&G 19% | Mayer 6%_\n"
-        f"_Base: BTC ${BASE_BTC}/wk | ETH ${BASE_ETH}/wk_\n"
         f"_AHR999: exp-regression × 2yr-MA | Miner: (subsidy+fees) / 365d-MA_"
     )
 
@@ -531,6 +566,8 @@ def run_monitor():
         )
         print(f"\n── Report ──\n{report}")
         send_telegram(report)
+        time.sleep(1)
+        send_telegram(REFERENCE_TABLE)
 
     except Exception as e:
         msg = f"❌ Monitor error: `{str(e)}`"
