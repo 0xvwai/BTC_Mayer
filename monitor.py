@@ -498,4 +498,44 @@ def build_report(
     )
 
 
-# ── 
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def run_monitor():
+    print("Starting BTC & ETH DCA monitor...")
+    try:
+        print("\n── BTC ──")
+        btc_price, btc_mayer                      = get_price_and_mayer("BTC/USD")
+        btc_mvrv,  btc_mvrv_date                  = get_mvrv("btc")
+        btc_ahr999, btc_ahr999_src                = get_ahr999(btc_price, "btc", "bitcoin")
+        btc_miner_ratio, btc_miner_rev,  \
+            btc_miner_ma365, btc_miner_date,  \
+            btc_miner_src                         = get_miner_revenue()
+
+        print("\n── ETH ──")
+        eth_price, eth_mayer                      = get_price_and_mayer("ETH/USD")
+        eth_mvrv,  eth_mvrv_date                  = get_mvrv("eth")
+        eth_ahr999, eth_ahr999_src                = get_ahr999(eth_price, "eth", "ethereum")
+
+        print("\n── Shared ──")
+        fng, fng_label                            = get_fear_and_greed()
+
+        report = build_report(
+            btc_price, btc_mayer,
+            btc_mvrv,  btc_mvrv_date,
+            btc_ahr999, btc_ahr999_src,
+            btc_miner_ratio, btc_miner_rev, btc_miner_ma365, btc_miner_date, btc_miner_src,
+            eth_price, eth_mayer,
+            eth_mvrv,  eth_mvrv_date,
+            eth_ahr999, eth_ahr999_src,
+            fng, fng_label,
+        )
+        print(f"\n── Report ──\n{report}")
+        send_telegram(report)
+
+    except Exception as e:
+        msg = f"❌ Monitor error: `{str(e)}`"
+        print(msg)
+        send_telegram(msg)
+
+if __name__ == "__main__":
+    run_monitor()
