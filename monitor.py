@@ -566,8 +566,8 @@ def run_monitor():
         )
         print(f"\n── Report ──\n{report}")
         send_telegram(report)
-        time.sleep(1)
-        send_telegram(REFERENCE_TABLE)
+        # time.sleep(1)                  # uncomment to re-enable reference table
+        # send_telegram(REFERENCE_TABLE)  # uncomment to re-enable reference table
 
     except Exception as e:
         msg = f"❌ Monitor error: `{str(e)}`"
