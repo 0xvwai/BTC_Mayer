@@ -11,7 +11,7 @@ CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 CM_BASE = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
 CM_HDR  = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
 
-# ── Strategy constants ─────────────────────────────────────────────────────────
+# ──Strategy constants─────────────────────────────────────────────────────────
 BASE_BTC = 250   # neutral weekly DCA — BTC ($)
 BASE_ETH = 125   # neutral weekly DCA — ETH ($ — 50% of BTC)
 
